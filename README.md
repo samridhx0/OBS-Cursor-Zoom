@@ -8,6 +8,8 @@ A fixed and updated version of the OBS Zoom to Mouse script, compatible with OBS
 
 > **Quick Start**: [Download obs-zoom-to-mouse.lua](obs-zoom-to-mouse.lua) → OBS → Tools → Scripts → + → Done! See [QUICKSTART.md](QUICKSTART.md) for details.
 
+https://www.youtube.com/watch?v=lXUZvyajciY
+
 ## About
 
 **This is an updated and fixed version of the excellent [obs-zoom-to-mouse](https://github.com/BlankSourceCode/obs-zoom-to-mouse) script by BlankSourceCode. The original script provides zoom functionality for OBS Studio display-capture sources, allowing you to zoom into your screen and follow your mouse cursor.**
