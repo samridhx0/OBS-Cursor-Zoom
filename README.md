@@ -115,8 +115,3 @@ Fixed for latest version by me (@samridhx0)
 
 This project maintains the same license as the original work.
 
-## Support
-
-If you find this useful, consider supporting the original author:
-
-<a href="https://www.buymeacoffee.com/blanksourcecode" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/default-orange.png" alt="Buy Me A Coffee" height="41" width="174"></a>
