@@ -6,7 +6,7 @@ A fixed and updated version of the OBS Zoom to Mouse script, compatible with OBS
 
 > This script is designed for OBS Studio 30.x and later. It uses the new scene item API and will not work with OBS 29.x or earlier.
 
-> **Quick Start**: [Download obs-zoom-to-mouse.lua](obs-zoom-to-mouse.lua) → OBS → Tools → Scripts → + → Done! See [QUICKSTART.md](QUICKSTART.md) for details.
+> **Quick Start**: [Download obs-zoom-to-mouse.lua](obs-zoom-to-mouse.lua) → OBS → Tools → Scripts → + → Done!
 
 
 ## About
