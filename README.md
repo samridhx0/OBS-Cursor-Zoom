@@ -8,7 +8,6 @@ A fixed and updated version of the OBS Zoom to Mouse script, compatible with OBS
 
 > **Quick Start**: [Download obs-zoom-to-mouse.lua](obs-zoom-to-mouse.lua) → OBS → Tools → Scripts → + → Done! See [QUICKSTART.md](QUICKSTART.md) for details.
 
-https://www.youtube.com/watch?v=lXUZvyajciY
 
 ## About
 
