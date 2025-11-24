@@ -1,9 +1,3 @@
---
--- OBS Zoom to Mouse
--- An OBS lua script to zoom a display-capture source to focus on the mouse.
--- Copyright (c) BlankSourceCode.  All rights reserved.
---
-
 local obs = obslua
 local ffi = require("ffi")
 local VERSION = "2.0.0"
@@ -96,12 +90,29 @@ local version_number = major * 100 + minor
 -- Define the mouse cursor functions for each platform
 if ffi.os == "Windows" then
     ffi.cdef([[
+        typedef void* HANDLE;
+        typedef void* HWND;
         typedef int BOOL;
+        typedef long LONG;
+        typedef long LPARAM;
         typedef struct{
             long x;
             long y;
         } POINT, *LPPOINT;
+        typedef struct tagRECT {
+            LONG left;
+            LONG top;
+            LONG right;
+            LONG bottom;
+        } RECT, *LPRECT;
+        typedef BOOL (__stdcall *WNDENUMPROC)(HWND, LPARAM);
+
         BOOL GetCursorPos(LPPOINT);
+        BOOL EnumWindows(WNDENUMPROC lpEnumFunc, LPARAM lParam);
+        int GetWindowTextA(HWND hWnd, char* lpString, int nMaxCount);
+        int GetClassNameA(HWND hWnd, char* lpClassName, int nMaxCount);
+        BOOL IsWindowVisible(HWND hWnd);
+        BOOL GetWindowRect(HWND hWnd, LPRECT lpRect);
     ]])
     win_point = ffi.new("POINT[1]")
 elseif ffi.os == "Linux" then
@@ -158,6 +169,135 @@ elseif ffi.os == "OSX" then
             osx_mouse_location = ffi.cast("CGPoint(*)(void*, void*)", imp)
         end
     end
+end
+
+local WINDOW_CAPTURE_IDS = {}
+if ffi.os == "Windows" then
+    WINDOW_CAPTURE_IDS = { "window_capture" }
+elseif ffi.os == "Linux" then
+    WINDOW_CAPTURE_IDS = { "xcomposite_input", "pipewire-window-capture", "window_capture" }
+elseif ffi.os == "OSX" then
+    WINDOW_CAPTURE_IDS = { "window_capture" }
+end
+
+local function decode_window_token(value)
+    if not value then
+        return ""
+    end
+    local decoded = value:gsub("#3A", ":")
+    decoded = decoded:gsub("#22", "#")
+    return decoded
+end
+
+local function parse_window_descriptor(value)
+    if not value or value == "" then
+        return nil
+    end
+
+    local title_token, class_token, exe_token = value:match("^([^:]*):([^:]*):([^:]*)")
+    if not title_token then
+        return nil
+    end
+
+    local descriptor = {
+        title = decode_window_token(title_token or ""),
+        class = decode_window_token(class_token or ""),
+        exe = decode_window_token(exe_token or "")
+    }
+
+    descriptor.title_lower = descriptor.title:lower()
+    descriptor.class_lower = descriptor.class:lower()
+
+    return descriptor
+end
+
+local function get_window_text(hwnd)
+    if ffi.os ~= "Windows" then
+        return ""
+    end
+
+    local buffer = ffi.new("char[512]")
+    local len = ffi.C.GetWindowTextA(hwnd, buffer, 512)
+    if len <= 0 then
+        return ""
+    end
+    return ffi.string(buffer, len)
+end
+
+local function get_window_class(hwnd)
+    if ffi.os ~= "Windows" then
+        return ""
+    end
+
+    local buffer = ffi.new("char[256]")
+    local len = ffi.C.GetClassNameA(hwnd, buffer, 256)
+    if len <= 0 then
+        return ""
+    end
+    return ffi.string(buffer, len)
+end
+
+local function window_descriptor_matches(descriptor, title, class_name)
+    if not descriptor then
+        return false
+    end
+
+    local title_lower = (title or ""):lower()
+    local class_lower = (class_name or ""):lower()
+
+    if descriptor.title ~= "" and descriptor.title_lower ~= title_lower then
+        return false
+    end
+
+    if descriptor.class ~= "" and descriptor.class_lower ~= class_lower then
+        return false
+    end
+
+    return true
+end
+
+local function find_window_bounds(descriptor)
+    if ffi.os ~= "Windows" or descriptor == nil then
+        return nil
+    end
+
+    local rect = ffi.new("RECT[1]")
+    local result = nil
+
+    local enum_callback = ffi.cast("BOOL (__stdcall *)(HWND, LPARAM)", function(hwnd, _)
+        if ffi.C.IsWindowVisible(hwnd) == 0 then
+            return 1
+        end
+
+        if ffi.C.GetWindowRect(hwnd, rect) == 0 then
+            return 1
+        end
+
+        local width = rect[0].right - rect[0].left
+        local height = rect[0].bottom - rect[0].top
+        if width <= 0 or height <= 0 then
+            return 1
+        end
+
+        local title = get_window_text(hwnd)
+        local class_name = get_window_class(hwnd)
+        if window_descriptor_matches(descriptor, title, class_name) then
+            result = {
+                x = rect[0].left,
+                y = rect[0].top,
+                width = width,
+                height = height
+            }
+            return 0
+        end
+
+        return 1
+    end)
+
+    ffi.C.EnumWindows(enum_callback, 0)
+    enum_callback:free()
+
+    return result
 end
 
 ---
@@ -303,6 +443,115 @@ function clamp(min, max, value)
     return math.max(min, math.min(max, value))
 end
 
+local function get_display_monitor_info(source)
+    if not is_display_capture(source) then
+        return nil
+    end
+
+    local info = nil
+    local dc_info = get_dc_info()
+    if dc_info ~= nil then
+        local props = obs.obs_source_properties(source)
+        if props ~= nil then
+            local monitor_id_prop = obs.obs_properties_get(props, dc_info.prop_id)
+            if monitor_id_prop then
+                local found = nil
+                local settings = obs.obs_source_get_settings(source)
+                if settings ~= nil then
+                    local to_match
+                    if dc_info.prop_type == "string" then
+                        to_match = obs.obs_data_get_string(settings, dc_info.prop_id)
+                    elseif dc_info.prop_type == "int" then
+                        to_match = obs.obs_data_get_int(settings, dc_info.prop_id)
+                    end
+
+                    local item_count = obs.obs_property_list_item_count(monitor_id_prop);
+                    for i = 0, item_count do
+                        local name = obs.obs_property_list_item_name(monitor_id_prop, i)
+                        local value
+                        if dc_info.prop_type == "string" then
+                            value = obs.obs_property_list_item_string(monitor_id_prop, i)
+                        elseif dc_info.prop_type == "int" then
+                            value = obs.obs_property_list_item_int(monitor_id_prop, i)
+                        end
+
+                        if value == to_match then
+                            found = name
+                            break
+                        end
+                    end
+                    obs.obs_data_release(settings)
+                end
+
+                if found then
+                    log("Parsing display name: " .. found)
+                    local x, y = found:match("(-?%d+),(-?%d+)")
+                    local width, height = found:match("(%d+)x(%d+)")
+
+                    info = { x = 0, y = 0, width = 0, height = 0 }
+                    info.x = tonumber(x, 10) or 0
+                    info.y = tonumber(y, 10) or 0
+                    info.width = tonumber(width, 10) or 0
+                    info.height = tonumber(height, 10) or 0
+                    info.scale_x = 1
+                    info.scale_y = 1
+                    info.display_width = info.width
+                    info.display_height = info.height
+
+                    log("Parsed the following display information\n" .. format_table(info))
+
+                    if info.width == 0 and info.height == 0 then
+                        info = nil
+                    end
+                end
+            end
+
+            obs.obs_properties_destroy(props)
+        end
+    end
+
+    return info
+end
+
+local function get_window_capture_monitor_info(source)
+    if not is_window_capture(source) then
+        return nil
+    end
+
+    if ffi.os ~= "Windows" then
+        log("WARNING: Auto-detecting window capture bounds is only supported on Windows.\n" ..
+            "         Enable manual overrides for other platforms.")
+        return nil
+    end
+
+    local settings = obs.obs_source_get_settings(source)
+    if settings == nil then
+        return nil
+    end
+
+    local descriptor = parse_window_descriptor(obs.obs_data_get_string(settings, "window"))
+    obs.obs_data_release(settings)
+
+    if descriptor == nil then
+        log("WARNING: Could not parse window capture settings for '" .. obs.obs_source_get_name(source) .. "'.")
+        return nil
+    end
+
+    local bounds = find_window_bounds(descriptor)
+    if not bounds then
+        log("WARNING: Could not locate window for '" .. obs.obs_source_get_name(source) .. "'.\n" ..
+            "         Try bringing the window to the foreground or set manual overrides.")
+        return nil
+    end
+
+    bounds.scale_x = 1
+    bounds.scale_y = 1
+    bounds.display_width = bounds.width
+    bounds.display_height = bounds.height
+
+    return bounds
+end
+
 ---
 -- Get the size and position of the monitor so that we know the top-left mouse point
 ---@param source any The OBS source
@@ -310,71 +559,11 @@ end
 function get_monitor_info(source)
     local info = nil
 
-    -- Only do the expensive look up if we are using automatic calculations on a display source
-    if is_display_capture(source) and not use_monitor_override then
-        local dc_info = get_dc_info()
-        if dc_info ~= nil then
-            local props = obs.obs_source_properties(source)
-            if props ~= nil then
-                local monitor_id_prop = obs.obs_properties_get(props, dc_info.prop_id)
-                if monitor_id_prop then
-                    local found = nil
-                    local settings = obs.obs_source_get_settings(source)
-                    if settings ~= nil then
-                        local to_match
-                        if dc_info.prop_type == "string" then
-                            to_match = obs.obs_data_get_string(settings, dc_info.prop_id)
-                        elseif dc_info.prop_type == "int" then
-                            to_match = obs.obs_data_get_int(settings, dc_info.prop_id)
-                        end
-
-                        local item_count = obs.obs_property_list_item_count(monitor_id_prop);
-                        for i = 0, item_count do
-                            local name = obs.obs_property_list_item_name(monitor_id_prop, i)
-                            local value
-                            if dc_info.prop_type == "string" then
-                                value = obs.obs_property_list_item_string(monitor_id_prop, i)
-                            elseif dc_info.prop_type == "int" then
-                                value = obs.obs_property_list_item_int(monitor_id_prop, i)
-                            end
-
-                            if value == to_match then
-                                found = name
-                                break
-                            end
-                        end
-                        obs.obs_data_release(settings)
-                    end
-
-                    -- This works for my machine as the monitor names are given as "U2790B: 3840x2160 @ -1920,0 (Primary Monitor)"
-                    -- I don't know if this holds true for other machines and/or OBS versions
-                    -- TODO: Update this with some custom FFI calls to find the monitor top-left x and y coordinates if it doesn't work for anyone else
-                    -- TODO: Refactor this into something that would work with Windows/Linux/Mac assuming we can't do it like this
-                    if found then
-                        log("Parsing display name: " .. found)
-                        local x, y = found:match("(-?%d+),(-?%d+)")
-                        local width, height = found:match("(%d+)x(%d+)")
-
-                        info = { x = 0, y = 0, width = 0, height = 0 }
-                        info.x = tonumber(x, 10) or 0
-                        info.y = tonumber(y, 10) or 0
-                        info.width = tonumber(width, 10) or 0
-                        info.height = tonumber(height, 10) or 0
-                        info.scale_x = 1
-                        info.scale_y = 1
-                        info.display_width = info.width
-                        info.display_height = info.height
-
-                        log("Parsed the following display information\n" .. format_table(info))
-
-                        if info.width == 0 and info.height == 0 then
-                            info = nil
-                        end
-                    end
-                end
-
-                obs.obs_properties_destroy(props)
-            end
+    if not use_monitor_override and source ~= nil then
+        if is_display_capture(source) then
+            info = get_display_monitor_info(source)
+        elseif is_window_capture(source) then
+            info = get_window_capture_monitor_info(source)
         end
     end
 
@@ -399,24 +588,33 @@ function get_monitor_info(source)
     return info
 end
 
----
--- Check to see if the specified source is a display capture source
--- If the source_to_check is nil then the answer will be false
----@param source_to_check any The source to check
----@return boolean result True if source is a display capture, false if it nil or some other source type
 function is_display_capture(source_to_check)
-    if source_to_check ~= nil then
-        local dc_info = get_dc_info()
-        if dc_info ~= nil then
-            -- Do a quick check to ensure this is a display capture
-            if allow_all_sources then
-                local source_type = obs.obs_source_get_id(source_to_check)
-                if source_type == dc_info.source_id then
-                    return true
-                end
-            else
-                return true
-            end
+    if source_to_check == nil then
+        return false
+    end
+
+    local dc_info = get_dc_info()
+    if dc_info == nil then
+        return false
+    end
+
+    local source_type = obs.obs_source_get_id(source_to_check)
+    return source_type == dc_info.source_id
+end
+
+function is_window_capture(source_to_check)
+    if source_to_check == nil then
+        return false
+    end
+
+    local source_type = obs.obs_source_get_id(source_to_check)
+    if not source_type then
+        return false
+    end
+
+    for _, id in ipairs(WINDOW_CAPTURE_IDS) do
+        if source_type == id then
+            return true
         end
     end
 
@@ -576,10 +774,12 @@ function refresh_sceneitem(find_newest)
         monitor_info = get_monitor_info(source)
     end
 
-    local is_non_display_capture = not is_display_capture(source)
-    if is_non_display_capture then
+    local source_is_display = is_display_capture(source)
+    local source_is_window = is_window_capture(source)
+    local require_manual_override = not (source_is_display or source_is_window)
+    if require_manual_override then
         if not use_monitor_override then
-            log("ERROR: Selected Zoom Source is not a display capture source.\n" ..
+            log("ERROR: Selected Zoom Source is not a display or window capture source.\n" ..
                 "       You MUST enable 'Set manual source position' and set the correct override values for size and position.")
         end
     end
@@ -626,8 +826,8 @@ function refresh_sceneitem(find_newest)
         sceneitem_crop = obs.obs_sceneitem_crop()
         obs.obs_sceneitem_get_crop(sceneitem, sceneitem_crop)
 
-        if is_non_display_capture then
-            -- Non-Display Capture sources don't correctly report crop values
+        if require_manual_override then
+            -- Non display/window capture sources don't correctly report crop values
             sceneitem_crop_orig.left = 0
             sceneitem_crop_orig.top = 0
             sceneitem_crop_orig.right = 0
@@ -802,9 +1002,9 @@ end
 function get_target_position(zoom)
     local mouse = get_mouse_pos()
 
-    -- If we have monitor information then we can offset the mouse by the top-left of the monitor position
-    -- This is because the display-capture source assumes top-left is 0,0 but the mouse uses the total desktop area,
-    -- so a second monitor might start at x:1920, y:0 for example, so when we click at 1920,0 we want it to look like we clicked 0,0 on the source.
+    -- If we have monitor information then we can offset the mouse by the top-left of the monitor/window position
+    -- This is because display- and window-capture sources assume top-left is 0,0 but the mouse uses the total desktop area,
+    -- so a second monitor or a window offset might start at x:1920, y:0 and we need to translate desktop coordinates back to source space.
     if monitor_info then
         mouse.x = mouse.x - monitor_info.x
         mouse.y = mouse.y - monitor_info.y
@@ -1221,8 +1421,8 @@ function on_print_help()
         "Help Information for OBS-Zoom-To-Mouse v" .. VERSION .. "\n" ..
         "https://github.com/BlankSourceCode/obs-zoom-to-mouse\n" ..
         "----------------------------------------------------\n" ..
-        "This script will zoom the selected display-capture source to focus on the mouse\n\n" ..
-        "Zoom Source: The display capture in the current scene to use for zooming\n" ..
+        "This script will zoom the selected display- or window-capture source to focus on the mouse\n\n" ..
+        "Zoom Source: The display or window capture in the current scene to use for zooming\n" ..
         "Zoom Factor: How much to zoom in by\n" ..
         "Zoom Speed: The speed of the zoom in/out animation\n" ..
         "Auto follow mouse: True to track the cursor while you are zoomed in\n" ..
@@ -1231,7 +1431,7 @@ function on_print_help()
         "Follow Border: The %distance from the edge of the source that will re-enable mouse tracking\n" ..
         "Lock Sensitivity: How close the tracking needs to get before it locks into position and stops tracking until you enter the follow border\n" ..
         "Auto Lock on reverse direction: Automatically stop tracking if you reverse the direction of the mouse\n" ..
-        "Show all sources: True to allow selecting any source as the Zoom Source - You MUST set manual source position for non-display capture sources\n" ..
+        "Show all sources: True to allow selecting any source as the Zoom Source - You MUST set manual source position for sources that are not display/window captures\n" ..
         "Set manual source position: True to override the calculated x/y (topleft position), width/height (size), and scaleX/scaleY (canvas scale factor) for the selected source\n" ..
         "X: The coordinate of the left most pixel of the source\n" ..
         "Y: The coordinate of the top most pixel of the source\n" ..
@@ -1257,13 +1457,13 @@ function on_print_help()
 end
 
 function script_description()
-    return "Zoom the selected display-capture source to focus on the mouse"
+    return "Zoom the selected display- or window-capture source to focus on the mouse"
 end
 
 function script_properties()
     local props = obs.obs_properties_create()
 
-    -- Populate the sources list with the known display-capture sources (OBS calls them 'monitor_capture' internally even though the UI says 'Display Capture')
+    -- Populate the sources list with the known display/window capture sources (OBS still labels monitor sources as 'Display Capture')
     local sources_list = obs.obs_properties_add_list(props, "source", "Zoom Source", obs.OBS_COMBO_TYPE_LIST,
         obs.OBS_COMBO_FORMAT_STRING)
 
@@ -1300,7 +1500,7 @@ function script_properties()
 
     local allow_all = obs.obs_properties_add_bool(props, "allow_all_sources", "Allow any zoom source ")
     obs.obs_property_set_long_description(allow_all, "Enable to allow selecting any source as the Zoom Source\n" ..
-        "You MUST set manual source position for non-display capture sources")
+        "You MUST set manual source position for sources that are not display/window captures")
 
     local override_props = obs.obs_properties_create();
     local override_label = obs.obs_properties_add_text(override_props, "monitor_override_label", "", obs.OBS_TEXT_INFO)
@@ -1596,11 +1796,19 @@ function populate_zoom_sources(list)
 
     local sources = obs.obs_enum_sources()
     if sources ~= nil then
+        local supported_ids = {}
         local dc_info = get_dc_info()
+        if dc_info ~= nil and dc_info.source_id ~= nil then
+            supported_ids[dc_info.source_id] = true
+        end
+        for _, id in ipairs(WINDOW_CAPTURE_IDS) do
+            supported_ids[id] = true
+        end
+
         obs.obs_property_list_add_string(list, "<None>", "obs-zoom-to-mouse-none")
         for _, source in ipairs(sources) do
             local source_type = obs.obs_source_get_id(source)
-            if source_type == dc_info.source_id or allow_all_sources then
+            if allow_all_sources or supported_ids[source_type] then
                 local name = obs.obs_source_get_name(source)
                 obs.obs_property_list_add_string(list, name, name)
             end
